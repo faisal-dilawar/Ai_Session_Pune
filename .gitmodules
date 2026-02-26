@@ -1,9 +1,9 @@
 [submodule "shopizer"]
 	path = shopizer
-	url = ./shopizer
+	url = https://github.com/faisal-dilawar/shopizer.git
 [submodule "shopizer-admin"]
 	path = shopizer-admin
-	url = ./shopizer-admin
+	url = https://github.com/faisal-dilawar/shopizer-admin.git
 [submodule "shopizer-shop-reactjs"]
 	path = shopizer-shop-reactjs
-	url = ./shopizer-shop-reactjs
+	url = https://github.com/faisal-dilawar/shopizer-shop-reactjs.git
