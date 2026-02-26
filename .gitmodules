@@ -1,0 +1,9 @@
+[submodule "shopizer"]
+	path = shopizer
+	url = ./shopizer
+[submodule "shopizer-admin"]
+	path = shopizer-admin
+	url = ./shopizer-admin
+[submodule "shopizer-shop-reactjs"]
+	path = shopizer-shop-reactjs
+	url = ./shopizer-shop-reactjs
