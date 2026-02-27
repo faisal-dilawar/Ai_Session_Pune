@@ -2,6 +2,7 @@
 
 **Created:** 2026-02-27
 **Last Reviewed:** 2026-02-27
+**Status:** Final — Ready for Team Review
 **Scope:** `shopizer` submodule (Spring Boot backend)
 **Goal:** Upgrade from Java 17 (sm-core-model: Java 11) to Java 21 LTS
 
@@ -47,11 +48,69 @@ This is a **major multi-phase upgrade**. Each phase must be completed, tested, a
 ## Production Guardrails (Non-Negotiable)
 
 1. **Branch per phase.** Never upgrade on `main` directly. Each phase gets its own branch (`upgrade/phase-N-name`) and a PR.
-2. **All tests must pass before merging any phase.** CI must be green. No exceptions.
+2. **CI must be green before merging any phase.** Push the branch, watch the GitHub Actions run pass, then merge. Never merge a red build.
 3. **Never delete a phase branch** until the next phase is stable — needed for rollback.
-4. **Smoke tests written in Phase 0 are the definition of "working".** If they pass, the phase is safe to merge.
-5. **Run `mvn enforcer:enforce` at the end of every phase** to catch version mismatches early.
-6. **Keep a rollback tag.** Created in Phase 0 — always available.
+4. **Smoke tests written in Phase 0 are the definition of "working".** If they pass before and after a phase, the phase is safe to merge.
+5. **Run `mvn enforcer:enforce` at the end of every phase** to catch version mismatches before they become mysterious runtime failures.
+6. **Keep a rollback tag.** Created in Phase 0 — always available at any point in the upgrade.
+
+---
+
+## CI/CD Considerations
+
+### CI Must Pass at Every Phase — Not Just the Final One
+
+The GitHub Actions workflow runs `mvn clean install -DskipTests` then `mvn test` on every push.
+This means **every phase branch must produce a green CI run** before it is merged.
+Do not rely on local test results alone — always push and confirm CI passes.
+
+Each phase's "Commit, push, PR → merge" step implicitly requires:
+```
+git push origin upgrade/phase-N-name
+# Watch GitHub Actions → must be green before merging PR
+```
+
+### Phase 4 — Bust the Maven Cache After Spring Boot 3 Upgrade
+
+The CI uses `cache: maven` in the GitHub Actions workflow. After Phase 4 introduces Spring Boot 3
+and hundreds of new/changed dependencies, the cache will be stale and can cause ghost failures
+(tests pass locally but fail in CI, or vice versa).
+
+After Phase 4 merges, force a cache refresh by updating the cache key in `backend.yml`:
+```yaml
+- uses: actions/setup-java@v4
+  with:
+    java-version: '17'
+    distribution: 'temurin'
+    cache: maven
+    cache-dependency-path: '**/pom.xml'   # add this line — triggers new cache on pom changes
+```
+
+### Phase 6 — Enforcer and GitHub Actions Must Change Atomically
+
+In Phase 6, two things change simultaneously:
+- Maven Enforcer: `[17,18)` → `[21,22)`
+- GitHub Actions: `java-version: '17'` → `java-version: '21'`
+
+**These must be in the same commit.** If the enforcer is updated first without updating the
+GitHub Actions Java version, CI will immediately fail on its own enforcer rule.
+If the GitHub Actions version is updated first, CI will run on Java 21 but the enforcer
+still passes `[17,18)` — a false pass that hides the discrepancy.
+
+One commit. Both changes together.
+
+### Add a CI Build Timeout
+
+The current workflow has no timeout. After Phase 4, build and test time will increase
+significantly due to new dependencies and Spring Boot 3 startup time in tests.
+Add a timeout to prevent a hung build from consuming GitHub Actions minutes indefinitely:
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30    # add this
+```
 
 ---
 
@@ -127,37 +186,227 @@ Write `@SpringBootTest(webEnvironment = RANDOM_PORT)` tests in:
 `sm-shop/src/test/java/com/salesmanager/test/shop/smoke/`
 
 All tests use the H2 in-memory database already configured.
+Use `TestRestTemplate` or `MockMvc` with `@AutoConfigureMockMvc`.
 
-**Priority 1 — Core API flows:**
+These tests are the **definition of "working"**. If they pass before the upgrade and fail after any phase, that phase broke something.
 
-| Flow | Endpoint | Method | Verify |
+---
+
+#### Test Group 1 — Health and Infrastructure
+
+| Test | Endpoint | Method | Assert |
 |------|----------|--------|--------|
-| Health check | `/api/actuator/health` | GET | `status: UP` |
-| Admin login | `/api/v1/private/login` | POST | 200 + token returned |
-| List products | `/api/v2/products` | GET | 200 + non-empty list |
-| Get product by code | `/api/v2/product/{code}` | GET | 200 + product fields |
-| Create category | `/api/v1/private/category` | POST | 201 |
-| Create product | `/api/v1/private/product` | POST | 201 |
-| Add to cart | `/api/v1/cart/` | POST | 201 |
-| Get cart | `/api/v1/cart/{code}` | GET | 200 |
-| Customer register | `/api/v1/customer/register` | POST | 201 |
-| Get store | `/api/v1/store/DEFAULT` | GET | 200 |
-| List orders | `/api/v1/private/orders` | GET | 200 |
+| `testHealthUp` | `/api/actuator/health` | GET | Status 200, body contains `"status":"UP"` |
+| `testStoreExists` | `/api/v1/store/DEFAULT` | GET | Status 200, body contains `"code":"DEFAULT"`, `"name"` is non-null and non-empty |
 
-**Priority 2 — Full JWT token flow (critical after jjwt rewrite):**
+---
 
-Write a dedicated test that covers the complete authentication cycle:
+#### Test Group 2 — Full JWT Authentication Lifecycle
+
+Write a single dedicated test class `JwtAuthenticationSmokeTest` that covers the complete token lifecycle in order:
 
 ```
-1. POST /api/v1/private/login  → expect 200 + JWT token
-2. GET  /api/v1/private/orders (no token) → expect 401
-3. GET  /api/v1/private/orders (valid admin token) → expect 200
-4. GET  /api/v1/private/orders (customer token on admin endpoint) → expect 403
-5. POST /api/v1/auth/login (customer) → expect 200 + token
-6. Use expired/malformed token → expect 401
+Step 1 — Mint admin token
+  POST /api/v1/private/login
+  Body: { "username": "admin@shopizer.com", "password": "password" }
+  Assert: 200
+  Assert: response body contains "token" field — extract the value
+
+Step 2 — Inspect token claims
+  Decode the JWT (do not verify signature in this step — just parse the payload)
+  Assert: "sub" claim is present and equals the admin username
+  Assert: "exp" claim is present and is a future timestamp
+
+Step 3 — Use valid token on protected endpoint
+  GET /api/v1/private/orders
+  Header: Authorization: Bearer <token from Step 1>
+  Assert: 200
+
+Step 4 — No token rejected
+  GET /api/v1/private/orders
+  No Authorization header
+  Assert: 401
+
+Step 5 — Malformed token rejected
+  GET /api/v1/private/orders
+  Header: Authorization: Bearer not.a.valid.jwt
+  Assert: 401
+
+Step 6 — Customer token rejected on admin endpoint
+  POST /api/v1/auth/login
+  Body: { "username": "test@shopizer.com", "password": "password" }
+  Assert: 200, extract customer token
+  GET /api/v1/private/orders
+  Header: Authorization: Bearer <customer token>
+  Assert: 403
 ```
 
-If this test fails after the jjwt migration in Phase 4, the new token signing is broken.
+If any step fails after Phase 4 (jjwt rewrite), the token signing or validation is broken.
+
+---
+
+#### Test Group 3 — Authentication Boundary Matrix
+
+Systematically cover every combination of: endpoint type × auth state.
+
+| Test | Endpoint | Auth State | Expected Status |
+|------|----------|------------|-----------------|
+| `testPublicProductListNoAuth` | GET `/api/v2/products` | No token | 200 |
+| `testPublicProductDetailNoAuth` | GET `/api/v2/product/{code}` | No token | 200 |
+| `testPublicStoreNoAuth` | GET `/api/v1/store/DEFAULT` | No token | 200 |
+| `testPublicCustomerRegisterNoAuth` | POST `/api/v1/customer/register` | No token | 201 |
+| `testPublicLoginNoAuth` | POST `/api/v1/private/login` | No token | 200 (login is public) |
+| `testAdminEndpointNoToken` | GET `/api/v1/private/orders` | No token | 401 |
+| `testAdminEndpointValidAdminToken` | GET `/api/v1/private/orders` | Valid admin JWT | 200 |
+| `testAdminEndpointCustomerToken` | GET `/api/v1/private/orders` | Valid customer JWT | 403 |
+| `testAdminEndpointExpiredToken` | GET `/api/v1/private/orders` | Expired JWT | 401 |
+| `testAdminWriteEndpointNoToken` | POST `/api/v1/private/product` | No token | 401 |
+| `testAdminWriteEndpointValidToken` | POST `/api/v1/private/product` | Valid admin JWT | 201 or 400 (not 401/403) |
+
+---
+
+#### Test Group 4 — Full Response Body Validation (Not Just Status Codes)
+
+For each public read endpoint, validate the full response body structure — not just the HTTP status.
+
+**Store endpoint:**
+```
+GET /api/v1/store/DEFAULT
+Assert status: 200
+Assert body:
+  - "code" = "DEFAULT"
+  - "name" is non-null, non-empty string
+  - "currency" is non-null
+  - "defaultLanguage" is non-null
+```
+
+**Product list endpoint:**
+```
+GET /api/v2/products?store=DEFAULT&lang=en
+Assert status: 200
+Assert body:
+  - "products" array is non-null
+  - if non-empty: first product has "code", "name", "price" fields
+  - "totalPages" is a non-negative integer
+  - "recordsTotal" is a non-negative integer
+```
+
+**Product detail endpoint** (requires a known product code from test data):
+```
+GET /api/v2/product/{code}
+Assert status: 200
+Assert body:
+  - "code" equals the requested code
+  - "name" is non-null, non-empty
+  - "price" is a positive number
+  - "available" is a boolean
+  - "productSpecifications" is non-null
+```
+
+---
+
+#### Test Group 5 — Validation Error Scenarios (400 Bad Request)
+
+These ensure the validation layer is working correctly — critical for detecting Spring Boot 3 `BindingResult` or `@Valid` regressions.
+
+| Test | Endpoint | Body | Expected |
+|------|----------|------|----------|
+| `testLoginMissingUsername` | POST `/api/v1/private/login` | `{ "password": "x" }` | 400 or 422 — not 500 |
+| `testLoginMissingPassword` | POST `/api/v1/private/login` | `{ "username": "x" }` | 400 or 422 — not 500 |
+| `testLoginEmptyBody` | POST `/api/v1/private/login` | `{}` | 400 or 401 — not 500 |
+| `testCustomerRegisterMissingEmail` | POST `/api/v1/customer/register` | body without email | 400 — not 500 |
+| `testCreateProductMissingCode` | POST `/api/v1/private/product` (admin JWT) | body without `code` | 400 — not 500 |
+
+The key assertion for all of these is: **must not return 500**. A 500 here means an exception is escaping the validation layer.
+
+---
+
+#### Test Group 6 — Data Integrity Round-Trips
+
+Test that data written in one API call can be read back correctly in another. This catches Hibernate mapping regressions, serialisation changes, and Jakarta Persistence issues.
+
+**Category round-trip:**
+```
+Step 1: POST /api/v1/private/category (admin JWT)
+  Body: { "code": "smoke-test-cat-01", "name": [{ "language": "en", "name": "Smoke Test Category" }] }
+  Assert: 201, extract the returned category ID
+
+Step 2: GET /api/v1/category/{id}
+  Assert: 200
+  Assert: "code" = "smoke-test-cat-01"
+  Assert: "name"[en] = "Smoke Test Category"
+  — must match what was sent, exactly
+```
+
+**Product round-trip:**
+```
+Step 1: POST /api/v1/private/product (admin JWT)
+  Body: { "code": "smoke-prod-01", "price": 29.99, "quantity": 10, ... }
+  Assert: 201
+
+Step 2: GET /api/v2/product/smoke-prod-01
+  Assert: 200
+  Assert: "price" = 29.99 (not rounded or transformed)
+  Assert: "quantity" = 10
+  — all fields must match what was written
+```
+
+---
+
+#### Test Group 7 — End-to-End Business Flow
+
+Test the full customer shopping journey to verify that the integrated system works, not just individual endpoints in isolation.
+
+```
+Step 1 — Setup: Create a product via admin API
+  POST /api/v1/private/product (admin JWT)
+  Assert: 201
+
+Step 2 — Customer: Add product to cart
+  POST /api/v1/cart/
+  Body: { "product": <id>, "quantity": 2 }
+  Assert: 201, extract cart code
+
+Step 3 — Customer: Read cart back
+  GET /api/v1/cart/{cartCode}
+  Assert: 200
+  Assert: cart contains exactly 1 line item
+  Assert: product code matches what was added
+  Assert: quantity = 2
+
+Step 4 — Customer: Register
+  POST /api/v1/customer/register
+  Body: valid customer payload
+  Assert: 201
+
+Step 5 — Customer: Login
+  POST /api/v1/auth/login
+  Assert: 200, extract customer JWT
+
+Step 6 — Customer: Place order
+  POST /api/v1/order/  (with customer JWT and cart code)
+  Assert: 201, extract order ID
+
+Step 7 — Admin: Verify order appears
+  GET /api/v1/private/orders (admin JWT)
+  Assert: 200
+  Assert: the order ID from Step 6 appears in the list
+```
+
+If this flow breaks, the system has a fundamental regression regardless of which individual-unit tests pass.
+
+---
+
+#### Baseline Checklist
+
+Before proceeding past Phase 0, confirm all of the following:
+
+- [ ] All 7 test groups compile and pass against the current codebase
+- [ ] Test count from `mvn test` is recorded (saved to `test-baseline.txt`)
+- [ ] `dependency-tree-phase-0.txt` is saved
+- [ ] Swagger endpoint list is exported/screenshot from `http://localhost:8080/swagger-ui.html`
+- [ ] `stable-pre-java21-upgrade` tag is pushed to remote
+- [ ] The `@Ignore` on `AbstractSalesManagerCoreTestCase` is documented as a known gap
 
 ---
 
