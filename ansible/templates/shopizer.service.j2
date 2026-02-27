@@ -1,0 +1,22 @@
+[Unit]
+Description=Shopizer Backend Service
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/opt/shopizer
+Environment="SPRING_DATASOURCE_URL=jdbc:mysql://localhost:3306/SALESMANAGER?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true"
+Environment="SPRING_DATASOURCE_USERNAME=root"
+Environment="SPRING_DATASOURCE_PASSWORD=password"
+Environment="SPRING_DATASOURCE_DRIVER_CLASS_NAME=com.mysql.cj.jdbc.Driver"
+Environment="SPRING_JPA_HIBERNATE_DDL_AUTO=update"
+# -cp . include current dir in classpath so database.properties is found
+ExecStart=/usr/bin/java -cp .:/opt/shopizer/shopizer.jar -Dloader.main=com.salesmanager.shop.application.ShopApplication org.springframework.boot.loader.JarLauncher
+SuccessExitStatus=143
+StandardOutput=journal
+StandardError=inherit
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

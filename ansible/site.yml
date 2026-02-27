@@ -1,0 +1,112 @@
+---
+- name: Provision and Deploy Shopizer to Colima
+  hosts: shopizer_server
+  become: yes
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install OpenJDK 17, Nginx and Python Docker support
+      apt:
+        name:
+          - openjdk-17-jdk
+          - nginx
+          - python3-docker
+        state: present
+
+    - name: Start MySQL Container
+      docker_container:
+        name: shopizer-db
+        image: mysql:8.0
+        state: started
+        restart_policy: always
+        env:
+          MYSQL_ROOT_PASSWORD: password
+          MYSQL_DATABASE: SALESMANAGER
+        ports:
+          - "3306:3306"
+
+    - name: Create Shopizer directory
+      file:
+        path: /opt/shopizer
+        state: directory
+        mode: '0755'
+
+    - name: Copy Backend JAR
+      copy:
+        src: ../ci-artifacts/shopizer.jar
+        dest: /opt/shopizer/shopizer.jar
+        mode: '0755'
+      notify: Restart Shopizer
+
+    - name: Deploy database.properties
+      template:
+        src: templates/database.properties.j2
+        dest: /opt/shopizer/database.properties
+        mode: '0644'
+      notify: Restart Shopizer
+
+    - name: Setup Systemd Service for Backend
+      template:
+        src: templates/shopizer.service.j2
+        dest: /etc/systemd/system/shopizer.service
+      notify: Reload Systemd
+
+    - name: Create Web directory for frontends
+      file:
+        path: /var/www/{{ item }}
+        state: directory
+        mode: '0755'
+      loop:
+        - admin
+        - shop
+
+    - name: Copy Admin Frontend files
+      copy:
+        src: ../ci-artifacts/shopizer-admin/
+        dest: /var/www/admin/
+        mode: '0755'
+
+    - name: Patch Admin env.js
+      template:
+        src: templates/env.js.j2
+        dest: /var/www/admin/assets/env.js
+        mode: '0644'
+
+    - name: Copy Shop React files
+      copy:
+        src: ../ci-artifacts/shop-react/
+        dest: /var/www/shop/
+        mode: '0755'
+
+    - name: Configure Nginx
+      template:
+        src: templates/nginx.conf.j2
+        dest: /etc/nginx/sites-available/default
+      notify: Restart Nginx
+
+    - name: Ensure services are started
+      systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop:
+        - shopizer
+        - nginx
+
+  handlers:
+    - name: Reload Systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Restart Shopizer
+      systemd:
+        name: shopizer
+        state: restarted
+
+    - name: Restart Nginx
+      systemd:
+        name: nginx
+        state: restarted
